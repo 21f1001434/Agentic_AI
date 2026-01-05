@@ -1,196 +1,214 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
-import re
+import json
+import streamlit as st
+import streamlit.components.v1 as components
 
 from config import Settings
+from traces.trace_store import TraceStore
+from core.run_pipeline import run_agentic_pipeline
 from knowledge_graph.schema_registry import SchemaRegistry
+from knowledge_graph.store import KnowledgeGraphStore
+from agents.planner_agent import PlannerAgent
 
 
-class SQLAgent:
-    """
-    Generates SELECT-only SQL Server queries with explicit columns.
-    Uses SchemaRegistry to ensure no hallucinated columns/tables.
-    """
+def render_ask_analytics(settings: Settings, trace_store: TraceStore, developer_mode: bool) -> None:
+    st.header("Ask Analytics")
 
-    def __init__(self, settings: Settings, registry: SchemaRegistry):
-        self.settings = settings
-        self.registry = registry
+    kg = KnowledgeGraphStore(settings.KNOWLEDGE_GRAPH_DIR)
+    registry = SchemaRegistry(settings.KNOWLEDGE_GRAPH_DIR)
 
-    def generate_sql(self, plan: Dict[str, Any], allowed_tables: List[str]) -> Dict[str, Any]:
-        reg = self.registry.load()
-        tables = [t for t in plan.get("tables", []) if t in reg.get("tables", {})]
-        if allowed_tables:
-            tables = [t for t in tables if t in allowed_tables]
-        if not tables:
-            raise ValueError("No valid tables in plan after validation.")
+    schema = kg.load_schema()
+    all_tables = sorted(schema.get("tables", {}).keys())
+    if not all_tables:
+        st.warning("Schema not available yet. (Auto bootstrap should run.)")
+        return
 
-        # Choose a "primary" table as first.
-        primary = tables[0]
-        joins = plan.get("joins", []) if isinstance(plan.get("joins", []), list) else []
+    # ------------------------------------------------------------
+    # Session defaults
+    # ------------------------------------------------------------
+    if "allowed_tables" not in st.session_state:
+        st.session_state["allowed_tables"] = all_tables
 
-        # Build FROM and JOIN clauses, validating join columns
-        from_clause = f"FROM {self._fmt_table(primary)} AS t0"
-        alias_map = {primary: "t0"}
-        join_clauses = []
-        alias_i = 1
+    if "allowed_tables_picker" not in st.session_state:
+        st.session_state["allowed_tables_picker"] = st.session_state["allowed_tables"]
 
-        for j in joins:
-            try:
-                lt = j["left_table"]
-                rt = j["right_table"]
-                lk = j["left_key"]
-                rk = j["right_key"]
-                jt = (j.get("join_type") or "LEFT").upper()
-            except Exception:
-                continue
+    if "large_mode" not in st.session_state:
+        st.session_state["large_mode"] = True
 
-            if lt not in tables or rt not in tables:
-                continue
-            if not self.registry.has_column(lt, lk) or not self.registry.has_column(rt, rk):
-                continue
+    if "last_result" not in st.session_state:
+        st.session_state["last_result"] = None
 
-            if lt not in alias_map:
-                alias_map[lt] = f"t{alias_i}"
-                alias_i += 1
-            if rt not in alias_map:
-                alias_map[rt] = f"t{alias_i}"
-                alias_i += 1
+    # ------------------------------------------------------------
+    # 1) Question
+    # ------------------------------------------------------------
+    st.subheader("1) Ask your question")
+    question = st.text_area(
+        "Business question",
+        value=st.session_state.get("question_tmp", ""),
+        height=90,
+        placeholder="e.g., Create a dashboard for weekly revenue trend by region and top customers.",
+    )
+    st.session_state["question_tmp"] = question
 
-            join_clauses.append(
-                f"{jt} JOIN {self._fmt_table(rt)} AS {alias_map[rt]} "
-                f"ON {alias_map[lt]}.[{lk}] = {alias_map[rt]}.[{rk}]"
-            )
+    # ------------------------------------------------------------
+    # 2) Table selection + LLM suggestions
+    # ------------------------------------------------------------
+    st.divider()
+    st.subheader("2) Table Selection (You control the final allowlist)")
 
-        # Select columns: dimensions + metric deps + time field; fallback to a safe subset
-        select_cols: List[str] = []
-        dims = [d for d in plan.get("dimensions", []) if isinstance(d, str)]
-        time_field = plan.get("time_field") if isinstance(plan.get("time_field"), str) else None
+    planner = PlannerAgent(settings=settings, kg=kg, registry=registry)
 
-        # Attempt to map dimension strings to actual columns (best effort)
-        for d in dims:
-            col_ref = self._resolve_column(d, tables, alias_map)
-            if col_ref:
-                select_cols.append(col_ref)
+    col1, col2 = st.columns([1, 1])
 
-        if time_field:
-            tf = self._resolve_column(time_field, tables, alias_map)
-            if tf and tf not in select_cols:
-                select_cols.append(tf)
+    with col1:
+        st.caption("Current allowlist (agents will only use these)")
+        allowed_tables = st.multiselect(
+            "Allowed tables",
+            options=all_tables,
+            default=st.session_state["allowed_tables_picker"],
+            key="allowed_tables_picker",
+        )
 
-        # Metric dependencies (columns) if provided
-        for m in plan.get("metrics", []):
-            if not isinstance(m, dict):
-                continue
-            dep = m.get("depends_on")
-            if isinstance(dep, list):
-                for c in dep:
-                    col_ref = self._resolve_column(str(c), tables, alias_map)
-                    if col_ref and col_ref not in select_cols:
-                        select_cols.append(col_ref)
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            if st.button("Reset allowlist to ALL tables"):
+                st.session_state["allowed_tables_picker"] = all_tables
+                st.session_state["allowed_tables"] = all_tables
+                st.rerun()
 
-        # If still empty, pick first N columns from primary
-        if not select_cols:
-            cols = self.registry.table_columns(primary)[: min(12, len(self.registry.table_columns(primary)))]
-            select_cols = [f"{alias_map[primary]}.[{c}] AS [{c}]" for c in cols]
+        with c2:
+            st.write(f"Selected: **{len(allowed_tables)}**")
 
-        # Ensure explicit cols and stable aliases
-        # Remove duplicates by alias name
-        seen = set()
-        cleaned = []
-        for c in select_cols:
-            alias = c.split(" AS ")[-1].strip() if " AS " in c else c
-            if alias not in seen:
-                seen.add(alias)
-                cleaned.append(c)
-        select_cols = cleaned
-
-        # WHERE filters - parameterized placeholders
-        params: Dict[str, Any] = {}
-        where = []
-        for idx, f in enumerate(plan.get("filters", []) if isinstance(plan.get("filters", []), list) else []):
-            if not isinstance(f, dict):
-                continue
-            field = str(f.get("field", "")).strip()
-            op = str(f.get("op", "=")).strip()
-            value = f.get("value")
-            col_ref = self._resolve_column(field, tables, alias_map)
-            if not col_ref:
-                continue
-
-            # col_ref is like "t0.[Col] AS [Col]" -> extract left part before AS
-            left = col_ref.split(" AS ")[0].strip()
-            p = f"p{idx}"
-            if op.lower() in ("in",):
-                # expect list
-                if not isinstance(value, list) or not value:
-                    continue
-                placeholders = []
-                for j, vv in enumerate(value):
-                    pj = f"{p}_{j}"
-                    params[pj] = vv
-                    placeholders.append(f":{pj}")
-                where.append(f"{left} IN ({', '.join(placeholders)})")
+    with col2:
+        st.caption("Agent suggestion (click to generate)")
+        if st.button("Suggest tables from my question", type="secondary"):
+            if not question.strip():
+                st.error("Type a question first.")
             else:
-                params[p] = value
-                # only allow simple ops
-                safe_ops = {"=", "!=", "<>", ">", ">=", "<", "<=", "like"}
-                if op.lower() not in safe_ops:
-                    op = "="
-                where.append(f"{left} {op} :{p}")
+                # Suggest from full schema (not current allowlist) so user can discover missing tables.
+                intent = planner.extract_intent(question, allowed_tables=all_tables)
+                reasoning = planner.schema_reasoning(intent=intent, allowed_tables=all_tables)
 
-        where_clause = f"WHERE {' AND '.join(where)}" if where else ""
+                st.session_state["suggested_tables"] = reasoning.get("candidate_tables", [])
+                st.session_state["suggested_intent"] = intent
+                st.session_state["suggested_reasoning"] = reasoning
 
-        # Add TOP for exploratory if not aggregated; safety guard can enforce too
-        top = int(self.settings.DEFAULT_EXPLORATORY_TOP)
-        select_prefix = f"SELECT TOP ({top}) "
-        select_list = ",\n  ".join(select_cols)
+        suggested = st.session_state.get("suggested_tables", [])
+        if suggested:
+            st.success(f"Suggested {len(suggested)} tables.")
+            st.write(suggested)
 
-        sql = "\n".join([
-            f"{select_prefix}\n  {select_list}",
-            from_clause,
-            *join_clauses,
-            where_clause,
-        ]).strip()
+            if st.button("Apply suggested tables as allowlist", type="primary"):
+                # ✅ Correctly update widget state + persisted allowlist
+                st.session_state["allowed_tables_picker"] = suggested
+                st.session_state["allowed_tables"] = suggested
+                st.rerun()
 
-        # Provide expected_columns (explicit)
-        plan["expected_columns"] = [self._alias_name(c) for c in select_cols]
-        return {"sql": sql, "params": params, "expected_columns": plan["expected_columns"]}
+            with st.expander("Show suggestion details (intent + scoring)"):
+                st.json({
+                    "intent": st.session_state.get("suggested_intent", {}),
+                    "schema_reasoning": st.session_state.get("suggested_reasoning", {}),
+                })
 
-    def _fmt_table(self, table_key: str) -> str:
-        # table_key like schema.table
-        schema, table = table_key.split(".", 1)
-        return f"[{schema}].[{table}]"
+    # Persist final allowlist from widget to session state
+    st.session_state["allowed_tables"] = allowed_tables
 
-    def _resolve_column(self, hint: str, tables: List[str], alias_map: Dict[str, str]) -> str | None:
-        """
-        Resolve a user-friendly field name to an actual column:
-        - if hint contains ".", treat as table_key.col
-        - else search in candidate tables by column name match (case-insensitive)
-        """
-        hint = (hint or "").strip()
-        if not hint:
-            return None
+    # ------------------------------------------------------------
+    # Large Query Mode (actually used by pipeline)
+    # ------------------------------------------------------------
+    st.session_state["large_mode"] = st.toggle(
+        "Large Query Mode (use MAX_RETURNED_ROWS)",
+        value=bool(st.session_state["large_mode"]),
+        help="ON: SQLAgent uses TOP(MAX_RETURNED_ROWS). OFF: uses TOP(DEFAULT_EXPLORATORY_TOP).",
+    )
 
-        if "." in hint:
-            tpart, cpart = hint.split(".", 1)
-            # tpart might be schema.table or table alias-ish; we only accept schema.table
-            if tpart in alias_map and self.registry.has_column(tpart, cpart):
-                a = alias_map[tpart]
-                return f"{a}.[{cpart}] AS [{cpart}]"
-            return None
+    # ------------------------------------------------------------
+    # 3) Run
+    # ------------------------------------------------------------
+    st.divider()
+    st.subheader("3) Run pipeline (Plan → HITL → Execute → Insights → Dashboard)")
 
-        # match by column name in any table
-        for t in tables:
-            cols = self.registry.table_columns(t)
-            for c in cols:
-                if c.lower() == hint.lower():
-                    a = alias_map.get(t, "t0")
-                    return f"{a}.[{c}] AS [{c}]"
-        return None
+    run_btn = st.button("Run", type="primary", disabled=not bool(question.strip()))
 
-    def _alias_name(self, col_expr: str) -> str:
-        m = re.search(r"\s+AS\s+\[(.+?)\]\s*$", col_expr, flags=re.IGNORECASE)
-        if m:
-            return m.group(1)
-        return col_expr
+    if run_btn:
+        run_id = trace_store.new_run()
+        result = run_agentic_pipeline(
+            settings=settings,
+            trace_store=trace_store,
+            run_id=run_id,
+            user_question=question,
+            allowed_tables=allowed_tables,
+            human_review=None,
+            developer_mode=developer_mode,
+            large_mode=bool(st.session_state["large_mode"]),  # ✅ pass down
+        )
+        st.session_state["last_result"] = result
+
+    # ------------------------------------------------------------
+    # Results
+    # ------------------------------------------------------------
+    result = st.session_state.get("last_result")
+    if not result:
+        st.info("Run the pipeline to generate plan + dashboard.")
+        return
+
+    status = result.get("status")
+    st.markdown(f"**Run ID:** `{result.get('run_id')}` • **Status:** `{status}`")
+
+    if status == "needs_human_review":
+        st.warning("Mode E: Human review required before executing SQL.")
+        packet = result.get("human_review_packet", {})
+        st.json(packet)
+
+        st.subheader("Provide explicit edits (JSON)")
+        default_edit = {"allowed_tables": allowed_tables, "plan": packet.get("proposed_plan", {})}
+        edit_text = st.text_area("Edits JSON", value=json.dumps(default_edit, indent=2), height=260)
+
+        if st.button("Approve & Continue", type="primary"):
+            try:
+                human_review = json.loads(edit_text)
+            except Exception as e:
+                st.error(f"Invalid JSON edits: {e}")
+                return
+
+            run_id = result["run_id"]
+            result2 = run_agentic_pipeline(
+                settings=settings,
+                trace_store=trace_store,
+                run_id=run_id,
+                user_question=question,
+                allowed_tables=allowed_tables,
+                human_review=human_review,
+                developer_mode=developer_mode,
+                large_mode=bool(st.session_state["large_mode"]),  # ✅ pass down
+            )
+            st.session_state["last_result"] = result2
+            result = result2
+            status = result.get("status")
+
+    if status in ("failed", "rejected", "failed_data_quality"):
+        st.error(result.get("error") or result.get("rejection") or result.get("data_quality"))
+        st.info("Open **Run Traces** to see node outputs & errors.")
+        return
+
+    if status == "success":
+        st.subheader("Insights")
+        st.json(result.get("insights", {}))
+
+        st.subheader("Dashboard Preview")
+        html = result.get("dashboard_html", "")
+        if html:
+            components.html(html, height=900, scrolling=True)
+        else:
+            st.warning("Dashboard HTML missing.")
+
+        if developer_mode:
+            st.subheader("Developer Outputs")
+            st.json({
+                "sql": result.get("sql"),
+                "exec_meta": result.get("exec_meta"),
+                "large_mode": bool(st.session_state["large_mode"]),
+                "allowed_tables_count": len(allowed_tables),
+            })
+            

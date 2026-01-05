@@ -6,7 +6,7 @@ import json
 import time
 import uuid
 import difflib
-
+from utils.json_sanitize import json_sanitize
 
 class TraceStore:
     """
@@ -85,8 +85,8 @@ class TraceStore:
         a = self.load(run_a)
         b = self.load(run_b)
         keys = keys or ["C_plan", "E_sql_generation", "I_insights", "J_dashboard"]
-        sa = json.dumps({k: a.get("nodes", {}).get(k, {}) for k in keys}, indent=2, sort_keys=True)
-        sb = json.dumps({k: b.get("nodes", {}).get(k, {}) for k in keys}, indent=2, sort_keys=True)
+        sa = json.dumps({k: a.get("nodes", {}).get(k, {}) for k in keys}, indent=2, default = json_sanitize, sort_keys=True)
+        sb = json.dumps({k: b.get("nodes", {}).get(k, {}) for k in keys}, indent=2, default = json_sanitize, sort_keys=True)
         diff = difflib.unified_diff(sa.splitlines(), sb.splitlines(), fromfile=run_a, tofile=run_b, lineterm="")
         return "\n".join(diff)
 
@@ -94,4 +94,4 @@ class TraceStore:
         return self.base / f"run_{run_id}.json"
 
     def _save(self, run_id: str, doc: Dict[str, Any]) -> None:
-        self._path(run_id).write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        self._path(run_id).write_text(json.dumps(doc, indent=2,default = json_sanitize), encoding="utf-8")

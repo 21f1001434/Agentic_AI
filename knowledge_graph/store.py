@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 from pathlib import Path
 import json
 import time
-
+from utils.json_sanitize import json_sanitize
 
 class KnowledgeGraphStore:
     """
@@ -25,4 +25,4 @@ class KnowledgeGraphStore:
     def save_schema(self, schema: Dict[str, Any]) -> None:
         schema = dict(schema)
         schema["updated_at"] = int(time.time())
-        self.schema_path.write_text(json.dumps(schema, indent=2), encoding="utf-8")
+        self.schema_path.write_text(json.dumps(schema, indent=2, default=json_sanitize), encoding="utf-8")

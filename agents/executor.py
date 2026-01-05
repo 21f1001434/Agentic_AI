@@ -1,67 +1,82 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Tuple
 import time
 import hashlib
 
 import pandas as pd
-from sqlalchemy import text
 
 from config import Settings
-from db.engine import build_engine
-from cache.cache_manager import QueryCache
-from observability.timing import timed_block
+from db import run_sql_query
+from cache.snapshot_cache import SnapshotCache  # your existing cache module
+from cache.duckdb_store import DuckDBStore
 
 
+@dataclass
 class Executor:
-    """
-    Executes safe SQL with:
-    - timeouts (configurable)
-    - fetch size
-    - cache (parquet snapshots)
-    """
+    settings: Settings
 
-    def __init__(self, settings: Settings):
-        self.settings = settings
-        self.engine = build_engine(settings)
-        self.cache = QueryCache(settings=settings)
+    def __post_init__(self) -> None:
+        self.cache = SnapshotCache(Path(self.settings.CACHE_DIR))
+        self.duckdb = DuckDBStore(Path(self.settings.DUCKDB_PATH))
 
-    def run(self, sql: str, params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    def _cache_key(self, sql: str, params: Dict[str, Any]) -> str:
+        payload = (sql + "|" + repr(sorted((params or {}).items()))).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def run(self, *, sql: str, params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """
+        Executes SQL safely (SELECT-only assumed already validated).
+        Uses Parquet snapshot caching.
+        Registers snapshots into DuckDB catalog for offline querying.
+        """
         start = time.time()
-        sql_hash = hashlib.sha256(sql.encode("utf-8")).hexdigest()[:16]
+        cache_key = self._cache_key(sql, params or {})
 
-        # Cache lookup
-        cached = self.cache.get(sql_hash=sql_hash)
+        # Try cache first
+        cached = self.cache.get(cache_key)
         if cached is not None:
+            df = cached
+            parquet_path = self.cache.path_for_key(cache_key)
+            if parquet_path:
+                self.duckdb.register_parquet(cache_key, parquet_path)
             meta = {
-                "sql_hash": sql_hash,
-                "cache": {"hit": True, "path": self.cache.path_for(sql_hash).as_posix()},
-                "rows": int(len(cached)),
+                "cache_key": cache_key,
+                "cache_hit": True,
+                "rows": int(len(df)),
                 "seconds": round(time.time() - start, 4),
-                "timeout_seconds": self.settings.STATEMENT_TIMEOUT_SECONDS,
+                "mode": "cache",
             }
-            return cached, meta
+            return df, meta
 
-        # Execute (statement timeout best-effort)
-        with self.engine.connect() as conn:
-            # best-effort statement timeout (SQL Server)
-            # For SQL Server, we can use SET LOCK_TIMEOUT / query timeout through driver; SQLAlchemy doesn't always propagate.
-            # We'll rely on driver-side timeout via connect args would be better; but keep safe meta.
-            with timed_block("sql_execute"):
-                df = pd.read_sql(text(sql), conn, params=params)
+        # Offline-only mode: do not hit DB
+        if bool(getattr(self.settings, "OFFLINE_ONLY", False)):
+            raise RuntimeError(
+                "OFFLINE_ONLY is enabled and no cache snapshot exists for this query. "
+                "Run once online (or create snapshots) to populate cache."
+            )
 
-        # Enforce max returned rows at executor level too (hard stop)
-        max_rows = int(self.settings.MAX_RETURNED_ROWS)
-        if max_rows > 0 and len(df) > max_rows:
-            df = df.head(max_rows)
+        # Execute against DB
+        df = run_sql_query(
+            sql=sql,
+            params=params or {},
+            timeout_seconds=int(self.settings.QUERY_TIMEOUT_SECONDS),
+            max_rows=int(self.settings.MAX_RETURNED_ROWS),
+        )
 
-        self.cache.put(sql_hash=sql_hash, df=df)
+        # Cache to parquet
+        self.cache.put(cache_key, df)
+        parquet_path = self.cache.path_for_key(cache_key)
+        if parquet_path:
+            self.duckdb.register_parquet(cache_key, parquet_path)
 
         meta = {
-            "sql_hash": sql_hash,
-            "cache": {"hit": False, "path": self.cache.path_for(sql_hash).as_posix()},
+            "cache_key": cache_key,
+            "cache_hit": False,
             "rows": int(len(df)),
             "seconds": round(time.time() - start, 4),
-            "timeout_seconds": self.settings.STATEMENT_TIMEOUT_SECONDS,
+            "mode": "db",
         }
         return df, meta
